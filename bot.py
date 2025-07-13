@@ -9,7 +9,7 @@ from sentence_transformers import SentenceTransformer
 # CONFIGURATION
 # -----------------------------
 EMBED_MODEL = "all-MiniLM-L6-v2"
-LLM_MODEL = "mistralai/Mistral-7B-Instruct-v0.1"
+LLM_MODEL = "google/flan-t5-base"
 TOP_K = 3
 
 # -----------------------------
