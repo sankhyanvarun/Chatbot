@@ -1,94 +1,59 @@
-import json
+import streamlit as st
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from sentence_transformers import SentenceTransformer
 import torch
 import faiss
-import streamlit as st
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from sentence_transformers import SentenceTransformer
+import json
+import numpy as np
 
-# -----------------------------
-# CONFIGURATION
-# -----------------------------
-EMBED_MODEL = "all-MiniLM-L6-v2"
 LLM_MODEL = "google/flan-t5-base"
+EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+DATA_FILE = "final.json"
 TOP_K = 3
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# -----------------------------
-# LOAD DATA
-# -----------------------------
-@st.cache_resource
+@st.cache_data
 def load_contexts():
-    with open("final.json", "r", encoding="utf-8") as f:
+    with open(DATA_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
-    return [entry["context"] for entry in data]
+    return [item["context"] for item in data if "context" in item]
 
-# -----------------------------
-# EMBEDDING + FAISS INDEX
-# -----------------------------
 @st.cache_resource
-def build_index(contexts):
-    embed_model = SentenceTransformer(EMBED_MODEL)
-    embeddings = embed_model.encode(contexts, convert_to_tensor=True, show_progress_bar=True)
+def build_faiss_index(contexts):
+    embedder = SentenceTransformer(EMBEDDING_MODEL)
+    embeddings = embedder.encode(contexts, convert_to_tensor=True, show_progress_bar=False)
     index = faiss.IndexFlatL2(embeddings.shape[1])
-    index.add(embeddings.cpu().numpy())
-    return embed_model, index, embeddings
+    index.add(embeddings.cpu().detach().numpy())
+    return embedder, index, embeddings
 
-# -----------------------------
-# LOAD LLM (Mistral)
-# -----------------------------
 @st.cache_resource
 def load_model():
     tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL)
-    model = AutoModelForCausalLM.from_pretrained(
-        LLM_MODEL,
-        torch_dtype=torch.float16,
-        device_map="auto"
-    )
+    model = AutoModelForSeq2SeqLM.from_pretrained(LLM_MODEL).to(DEVICE)
     return tokenizer, model
 
-# -----------------------------
-# HELPER FUNCTIONS
-# -----------------------------
-def generate_prompt(question, contexts):
-    joined = "\n---\n".join(contexts)
-    return f"<s>[INST] Use the following college context to answer the question.\n\nContext:\n{joined}\n\nQuestion: {question} [/INST]"
+def generate_answer(query, contexts, embedder, index, tokenizer, model):
+    query_embedding = embedder.encode(query, convert_to_tensor=True).cpu().numpy()
+    scores, retrieved_idxs = index.search(np.array([query_embedding]), k=TOP_K)
+    retrieved_contexts = [contexts[i] for i in retrieved_idxs[0]]
+    combined_context = "\n".join(retrieved_contexts)
+    
+    prompt = f"Answer the question based on the context.\n\nContext: {combined_context}\n\nQuestion: {query}"
+    inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True).to(DEVICE)
+    outputs = model.generate(**inputs, max_new_tokens=256)
+    answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return answer
 
-def get_answer(prompt, tokenizer, model):
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-    with torch.no_grad():
-        output = model.generate(
-            **inputs,
-            max_new_tokens=256,
-            temperature=0.7,
-            top_k=50,
-            top_p=0.9,
-            do_sample=True,
-        )
-    return tokenizer.decode(output[0], skip_special_tokens=True)
-
-# -----------------------------
-# STREAMLIT UI
-# -----------------------------
-st.set_page_config(page_title="College Chatbot", layout="centered")
+# UI
+st.set_page_config(page_title="🎓 College Chatbot", layout="centered")
 st.title("🎓 College Chatbot")
-st.write("Ask me anything about the college!")
+st.markdown("Ask me anything about the college!")
 
-question = st.text_input("You:", placeholder="e.g. What are the library timings?")
-
-if question:
-    # Load everything
-    contexts = load_contexts()
-    embed_model, index, embeddings = build_index(contexts)
-    tokenizer, model = load_model()
-
-    # RAG Retrieval
-    q_embedding = embed_model.encode(question, convert_to_tensor=True).cpu().numpy()
-    D, I = index.search(q_embedding.reshape(1, -1), k=TOP_K)
-    retrieved = [contexts[i] for i in I[0]]
-
-    # Generate answer
-    prompt = generate_prompt(question, retrieved)
+user_input = st.text_input("You:", placeholder="e.g., What are library hours?")
+if user_input:
     with st.spinner("Thinking..."):
-        answer = get_answer(prompt, tokenizer, model)
-
-    st.markdown("**Bot:**")
-    st.success(answer)
+        contexts = load_contexts()
+        embedder, index, _ = build_faiss_index(contexts)
+        tokenizer, model = load_model()
+        response = generate_answer(user_input, contexts, embedder, index, tokenizer, model)
+    st.markdown(f"**Bot:** {response}")
